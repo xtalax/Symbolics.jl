@@ -1,4 +1,5 @@
 using SymbolicUtils
+using SymbolicUtils: @capture
 using StaticArrays
 import Base: eltype, length, ndims, size, axes, eachindex
 
@@ -45,13 +46,12 @@ struct ArrayOp{T<:AbstractArray} <: Symbolic{T}
     shape
     ranges::Dict{Sym, AbstractRange} # index range each index symbol can take,
                                      # optional for each symbol
-    output_view
     metadata
 end
 
-function ArrayOp(T::Type, output_idx, expr, reduce, term, ranges=Dict(), output_view=nothing; metadata=nothing)
+function ArrayOp(T::Type, output_idx, expr, reduce, term, ranges=Dict(); metadata=nothing)
     sh = make_shape(output_idx, unwrap(expr), ranges)
-    ArrayOp{T}(output_idx, unwrap(expr), reduce, term, sh, ranges, output_view, metadata)
+    ArrayOp{T}(output_idx, unwrap(expr), reduce, term, sh, ranges, metadata)
 end
 
 function ArrayOp(a::AbstractArray)
@@ -207,7 +207,7 @@ function make_shape(output_idx, expr, ranges=Dict())
             end
             mi = matches[i]
             @assert !isempty(mi)
-            get(first(mi))
+            return get_extents(mi)
         elseif i isa Integer
             return Base.OneTo(1)
         end
@@ -228,7 +228,7 @@ function ranges(a::ArrayOp)
         if haskey(a.ranges, i)
             rs[i] = a.ranges[i]
         else
-            rs[i] = get(first(ax[i]))
+            rs[i] = ax[i] #get_extents(ax[i])
         end
     end
     return rs
@@ -256,6 +256,8 @@ function call2term(expr, arrs=[])
             return expr
         end
         return Expr(:call, term, map(call2term, expr.args)...)
+    elseif expr.head == :ref
+        return Expr(:ref, call2term(expr.args[1]), expr.args[2:end]...)
     elseif expr.head == Symbol("'")
         return Expr(:call, term, adjoint, map(call2term, expr.args)...)
     end
@@ -287,6 +289,29 @@ function Base.get(a::AxisOf)
     axes(a.A, a.dim)
 end
 
+function get_extents(xs)
+    boundaries = map(x->x.boundary, xs)
+    if all(iszero, boundaries)
+        get(first(xs))
+    else
+        extent = get(first(xs))
+        start_offset = -reduce(min, filter(x->x<0, boundaries), init=0)
+        end_offset = reduce(max, filter(x->x>0, boundaries), init=0)
+
+        (first(extent) + start_offset):(last(extent) - end_offset)
+    end
+end
+
+get_extents(x::AbstractRange) = x
+
+## Walk expr looking for symbols used in getindex expressions
+# Returns a dictionary of Sym to a vector of AxisOf objects.
+# The vector has as many elements as the number of times the symbol
+# appears in the expr. AxisOf has three fields:
+# A: the array whose indexing it appears in
+# dim: The dimension of the array indexed
+# boundary: how much padding is this indexing requiring, for example
+#   boundary is 2 for x[i + 2], and boundary = -2 for x[i - 2]
 function idx_to_axes(expr, dict=Dict{Sym, Vector}(), ranges=Dict())
     if istree(expr)
         if operation(expr) === (getindex)
@@ -496,7 +521,7 @@ end
 function axes(A::Union{Arr, SymArray})
     s = shape(unwrap(A))
     s === Unknown() && error("axes of $A not known")
-    return s
+    return map(x->1:length(x), s)
 end
 
 
@@ -518,137 +543,6 @@ function get_variables!(vars, e::Arr, varlist=nothing)
 end
 
 
-function SymbolicUtils.Code.toexpr(x::ArrayOp, st)
-    haskey(st.symbolify, x) && return st.symbolify[x]
-
-    if istree(x.term)
-        toexpr(x.term, st)
-    else
-        throw(ArgumentError("""Don't know how to turn $x
-                               into code yet"""))
-    end
-end
-
-function SymbolicUtils.Code.toexpr(x::Arr, st)
-    toexpr(unwrap(x), st)
-end
-struct ArrayMaker{T, AT<:AbstractArray} <: Symbolic{AT}
-    shape
-    sequence
-end
-
-shape(am::ArrayMaker) = am.shape
-
-function ArrayMaker{T}(sz::NTuple{N, Integer}, seq::Array=[]; atype=Array) where {N,T}
-    ArrayMaker{T, atype{T, N}}(map(x->1:x, sz), seq)
-end
-
-(::Type{ArrayMaker{T}})(i::Int...; atype=Array) where {T} = ArrayMaker{T}(i, atype=atype)
-
-function Base.show(io::IO, ac::ArrayMaker)
-    ovs = map(x -> x.output_view, ac.sequence)
-    print(io, Expr(:call, :ArrayMaker, ac.shape,
-                   Expr(:block, (ovs .=> ac.sequence)...)))
-end
-
-function get_indexers(ex)
-    @assert ex.head == :ref
-    arr = ex.args[1]
-    replace_ends(arr, ex.args[2:end])
-end
-
-function search_and_replace(expr, key, val)
-    isequal(expr, key) && return val
-
-    expr isa Expr ?
-        Expr(expr.head, map(x->search_and_replace(x, key,val), expr.args)...) :
-        expr
-end
-
-function replace_ends(arr, idx)
-    [search_and_replace(ix, :end, :(lastindex($arr, $i)))
-     for (i, ix) in enumerate(idx)]
-end
-
-macro setview!(definition, arrayop)
-    setview(definition, arrayop, true)
-end
-
-macro setview(definition, arrayop)
-    setview(definition, arrayop, false)
-end
-
-output_index_ranges(c::CartesianIndices) = c.indices
-output_index_ranges(ix...) = ix
-
-function setview(definition, arrayop, inplace)
-    output_view = get_indexers(definition)
-    output_ref = definition.args[1]
-    push = inplace ? (am, op) -> push!(am.sequence, op) : (am, op) -> typeof(am)(am.shape, vcat(am.sequence, op))
-    quote
-        let
-            _aop = $arrayop
-            $push($output_ref,
-                  $Setfield.@set! _aop.output_view = $output_index_ranges($(output_view...)))
-            $output_ref
-        end
-    end |> esc
-end
-
-macro makearray(definition, sequence)
-    output_shape = get_indexers(definition)
-    output_name = definition.args[1]
-
-    seq = map(filter(x->!(x isa LineNumberNode), sequence.args)) do pair
-        @assert pair.head == :call && pair.args[1] == :(=>)
-        # TODO: make sure the same symbol is used for the lhs array
-        :(@setview! $(pair.args[2]) $(pair.args[3]))
-    end
-
-    quote
-        $output_name = $ArrayMaker{Real}(map(length, ($(output_shape...),)))
-        $(seq...)
-    end |> esc
-end
-
-function best_order(output_idx, ks, rs)
-    unique!(filter(issym, vcat(reverse(output_idx)..., collect(ks))))
-end
-
-function SymbolicUtils.Code.toexpr(x::ArrayMaker, st)
-    outsym = Symbol("_out")
-    N = length(x.shape)
-    ex = :(let $outsym = zeros(Float64, map(length, ($(x.shape...),)))
-          $(inplace_expr(x, outsym))
-      end) |> LiteralExpr
-    toexpr(ex, st)
-end
-
-function inplace_expr(x::ArrayMaker, outsym = Symbol("_out"))
-    quote
-        $(map(a->inplace_expr(a, outsym), x.sequence)...)
-    end
-end
-
-function inplace_expr(x::ArrayOp, outsym = Symbol("_out"))
-    rs = copy(ranges(x))
-    loops = best_order(x.output_idx, keys(rs), rs)
-
-    inner_expr = :($outsym[$(x.output_idx...)] = $(x.reduce)($outsym[$(x.output_idx...)], $(x.expr)))
-
-    if x.output_view != nothing
-        for (i, rng) in zip(x.output_idx, x.output_view)
-            rs[i] = rng
-        end
-    end
-
-    foldl(reverse(loops), init=inner_expr) do acc, k
-        :(for $k in $(rs[k])
-              $acc
-          end)
-    end |> SymbolicUtils.Code.LiteralExpr
-end
-
 ### Scalarize
 
 scalarize(a::Array) = map(scalarize, a)
@@ -657,7 +551,7 @@ val2num(::Val{n}) where n = n
 
 function replace_by_scalarizing(ex, dict)
     rule = @rule(getindex(~x, ~~i) =>
-              scalarize(~x, (map(j->haskey(dict,j) ? dict[j] : j, ~~i)...,)))
+                 scalarize(~x, (map(j->substitute(j, dict), ~~i)...,)))
 
     simterm = (x, f, args; kws...) -> begin
         if f === Base.literal_pow && length(args) == 3
@@ -672,7 +566,7 @@ function replace_by_scalarizing(ex, dict)
             base = args[2]
             exp = val2num(only(args[3]))
             f = only(args[1])
-            args = [base,exp]
+            args = [base, exp]
         end
 
         if metadata(x) !== nothing
@@ -696,9 +590,21 @@ function replace_by_scalarizing(ex, dict)
         end
     end
 
-    # This must be a Prewalk to avoid descending into ArrayOp (madness)
-    Prewalk(Rewriters.PassThrough(Rewriters.If(x->!(x isa ArrayOp), Chain([rewrite_operation, rule]))), similarterm=simterm)(ex)
+    prewalk_if(x->!(x isa ArrayOp || x isa ArrayMaker),
+               Rewriters.PassThrough(Chain([rewrite_operation, rule])),
+              ex, simterm)
 end
+
+function prewalk_if(cond, f, t, similarterm)
+    t′ = cond(t) ? f(t) : return t
+    if istree(t′)
+        return similarterm(t′, operation(t′),
+                           map(x->prewalk_if(cond, f, x, similarterm), arguments(t′)))
+    else
+        return t′
+    end
+end
+
 
 function scalarize(arr::AbstractArray, idx)
     arr[idx...]
@@ -772,18 +678,19 @@ function scalarize(arr::ArrayOp, idx)
     iidx = collect(keys(axs))
     contracted = setdiff(iidx, arr.output_idx)
 
-    dict = Dict(oi => (unwrap(i) isa Symbolic ? unwrap(i) : axs[oi][i])
-                for (oi, i) in zip(arr.output_idx, idx) if unwrap(oi) isa Symbolic)
-    partial = replace_by_scalarizing(arr.expr, dict)
-
-    axes = [axs[c] for c in contracted]
-    if isempty(contracted)
-        partial
+    axes = [get_extents(axs[c]) for c in contracted]
+    summed = if isempty(contracted)
+        arr.expr
     else
         mapreduce(arr.reduce, Iterators.product(axes...)) do idx
-            replace_by_scalarizing(partial, Dict(contracted .=> idx))
+            replace_by_scalarizing(arr.expr, Dict(contracted .=> idx))
         end
     end
+
+    dict = Dict(oi => (unwrap(i) isa Symbolic ? unwrap(i) : get_extents(axs[oi])[i])
+                for (oi, i) in zip(arr.output_idx, idx) if unwrap(oi) isa Symbolic)
+
+    replace_by_scalarizing(summed, dict)
 end
 
 scalarize(arr::Arr, idx) = wrap(scalarize(unwrap(arr),
@@ -792,7 +699,7 @@ scalarize(arr::Arr, idx) = wrap(scalarize(unwrap(arr),
 function scalarize(arr)
     if arr isa Arr || arr isa Symbolic{<:AbstractArray}
         map(Iterators.product(axes(arr)...)) do i
-            scalarize(arr[i...])
+            scalarize(arr[i...]) # Use arr[i...] here to trigger any getindex hooks
         end
     elseif istree(arr) && operation(arr) == getindex
         args = arguments(arr)
@@ -813,3 +720,359 @@ Base.collect(x::SymArray) = scalarize(x)
 isarraysymbolic(x) = unwrap(x) isa Symbolic && SymbolicUtils.symtype(unwrap(x)) <: AbstractArray
 
 Base.convert(::Type{<:Array{<:Any, N}}, arr::Arr{<:Any, N}) where {N} = scalarize(arr)
+
+
+### Stencils
+
+struct ArrayMaker{T, AT<:AbstractArray} <: Symbolic{AT}
+    shape
+    sequence
+    metadata
+end
+
+function ArrayMaker(a::ArrayLike; eltype=eltype(a))
+    ArrayMaker{eltype}(size(a), Any[axes(a) => a])
+end
+
+function arraymaker(T, shape, views, seq...)
+    ArrayMaker{T}(shape, [(views .=> seq)...], nothing)
+end
+
+TermInterface.istree(x::ArrayMaker) = true
+TermInterface.operation(x::ArrayMaker) = arraymaker
+TermInterface.arguments(x::ArrayMaker) = [eltype(x), shape(x), map(first, x.sequence), map(last, x.sequence)...]
+
+shape(am::ArrayMaker) = am.shape
+
+function ArrayMaker{T}(sz::NTuple{N, Integer}, seq::Array=[]; atype=Array, metadata=nothing) where {N,T}
+    ArrayMaker{T, atype{T, N}}(map(x->1:x, sz), seq, metadata)
+end
+
+(::Type{ArrayMaker{T}})(i::Int...; atype=Array) where {T} = ArrayMaker{T}(i, atype=atype)
+
+function Base.show(io::IO, ac::ArrayMaker)
+    print(io, Expr(:call, :ArrayMaker, ac.shape,
+                   Expr(:block, ac.sequence...)))
+end
+
+function get_indexers(ex)
+    @assert ex.head == :ref
+    arr = ex.args[1]
+    replace_ends(arr, ex.args[2:end])
+end
+
+function search_and_replace(expr, key, val)
+    isequal(expr, key) && return val
+
+    expr isa Expr ?
+        Expr(expr.head, map(x->search_and_replace(x, key,val), expr.args)...) :
+        expr
+end
+
+function replace_ends(arr, idx)
+    [search_and_replace(ix, :end, :(lastindex($arr, $i)))
+     for (i, ix) in enumerate(idx)]
+end
+
+macro setview!(definition, arrayop)
+    setview(definition, arrayop, true)
+end
+
+macro setview(definition, arrayop)
+    setview(definition, arrayop, false)
+end
+
+output_index_ranges(c::CartesianIndices) = c.indices
+output_index_ranges(ix...) = ix
+
+function setview(definition, arrayop, inplace)
+    output_view = get_indexers(definition)
+    output_ref = definition.args[1]
+
+    function check_assignment(vw, op)
+        try Base.Broadcast.broadcast_shape(map(length, vw), size(op))
+        catch err
+            if err isa DimensionMismatch
+                throw(DimensionMismatch("setview did not work while assigning " *
+                                        "$vw to $op. LHS has size $(map(length, vw)) "*
+                                        "and RHS has size $(size(op)) " *
+                                        "-- they need to be broadcastable."))
+            else
+                rethrow(err)
+            end
+        end
+    end
+
+    function push(inplace)
+        if inplace
+            function (am, vw, op)
+                check_assignment(vw, op)
+                # assert proper size match
+                push!(am.sequence, vw => op)
+                am
+            end
+        else
+            function (am, vw, op)
+                check_assignment(vw, op)
+                if am isa ArrayMaker
+                    typeof(am)(am.shape, vcat(am.sequence, vw => op))
+                else
+                    am = ArrayMaker(am)
+                    push!(am.sequence, vw => op)
+                    am
+                end
+            end
+        end
+    end
+    quote
+        $(push(inplace))($output_ref,
+                         $output_index_ranges($(output_view...)), $unwrap($arrayop))
+    end |> esc
+end
+
+macro makearray(definition, sequence)
+    output_shape = get_indexers(definition)
+    output_name = definition.args[1]
+
+    seq = map(filter(x->!(x isa LineNumberNode), sequence.args)) do pair
+        @assert pair.head == :call && pair.args[1] == :(=>)
+        # TODO: make sure the same symbol is used for the lhs array
+        :(@setview! $(pair.args[2]) $(pair.args[3]))
+    end
+
+    quote
+        $output_name = $ArrayMaker{Real}(map(length, ($(output_shape...),)))
+        $(seq...)
+        $output_name = $wrap($output_name)
+    end |> esc
+end
+
+function best_order(output_idx, ks, rs)
+    unique!(filter(issym, vcat(reverse(output_idx)..., collect(ks))))
+end
+
+function _cat(x, xs...; dims)
+    arrays = (x, xs...)
+    if dims isa Integer
+        sz = Base.cat_size_shape(Base.dims2cat(dims), arrays...)
+        T = reduce(promote_type, eltype.(xs), init=eltype(x))
+        newdim = cumsum(map(a->size(a, dims), arrays))
+        start = 1
+        A = ArrayMaker{T}(sz...)
+        for (dim, array) in zip(newdim, arrays)
+            idx = CartesianIndices(ntuple(n -> n==dims ?
+                                          (start:dim) : (1:sz[n]), length(sz)))
+            start = dim + 1
+
+            @setview! A[idx] array
+        end
+        return A
+    else
+        error("Block diagonal concatenation not supported")
+    end
+end
+
+Base.cat(x::Arr, xs...; dims) = _cat(x, xs...; dims)
+Base.cat(x::AbstractArray, y::Arr, xs...; dims) = _cat(x, y, xs...; dims)
+
+Base.vcat(x::Arr, xs::AbstractVecOrMat...) = cat(x, xs..., dims=1)
+Base.hcat(x::Arr, xs::AbstractVecOrMat...) = cat(x, xs..., dims=2)
+Base.vcat(x::AbstractVecOrMat, y::Arr, xs::AbstractVecOrMat...) = _cat(x, y, xs..., dims=1)
+Base.hcat(x::AbstractVecOrMat, y::Arr, xs::AbstractVecOrMat...) = _cat(x, y, xs..., dims=2)
+Base.vcat(x::Arr, y::Arr) = _cat(x, y, dims=1) # plug ambiguity
+Base.hcat(x::Arr, y::Arr) = _cat(x, y, dims=2)
+
+function scalarize(x::ArrayMaker)
+    T = eltype(x)
+    A = Array{wrapper_type(T)}(undef, size(x))
+    for (vw, arr) in x.sequence
+        if any(x->x isa AbstractArray, vw)
+            A[vw...] .= scalarize(arr)
+        else
+            A[vw...] = scalarize(arr)
+        end
+    end
+    A
+end
+
+function scalarize(x::ArrayMaker, idx)
+    for (vw, arr) in reverse(x.sequence) # last one wins
+        if any(x->issym(x) || istree(x), idx)
+            return term(getindex, x, idx...)
+        end
+        if all(in.(idx, vw))
+            if symtype(arr) <: AbstractArray
+                # Filter out non-array indices because the RHS will be one dim less
+                el = [searchsortedfirst(v, i)
+                      for (v, i) in zip(vw, idx) if v isa AbstractArray]
+                return scalarize(arr[el...])
+            else
+                return arr
+            end
+        end
+    end
+    throw(BoundsError(x, idx))
+end
+
+
+### Codegen
+
+function SymbolicUtils.Code.toexpr(x::ArrayOp, st)
+    haskey(st.symbolify, x) && return st.symbolify[x]
+
+    if istree(x.term)
+        toexpr(x.term, st)
+    else
+        throw(ArgumentError("""Don't know how to turn $x
+                               into code yet"""))
+    end
+end
+
+function SymbolicUtils.Code.toexpr(x::Arr, st)
+    toexpr(unwrap(x), st)
+end
+
+function SymbolicUtils.Code.toexpr(x::ArrayMaker, st)
+    outsym = Symbol("_out")
+    N = length(x.shape)
+    ex = :(let $outsym = zeros(Float64, map(length, ($(x.shape...),)))
+          $(inplace_expr(x, outsym))
+          $outsym
+      end) |> LiteralExpr
+    toexpr(ex, st)
+end
+
+function inplace_expr(x, out_array)
+    :(copy!($out_array, $x))
+end
+
+function inplace_expr(x::ArrayMaker, out = :_out)
+    ex = []
+
+    intermediates = Dict()
+    for (i, (vw, op)) in enumerate(x.sequence)
+        out′ = Symbol(out, "_", i)
+        push!(ex, :($out′ = $view($out, $(vw...))))
+        push!(ex, inplace_expr(unwrap(op), out′, intermediates))
+    end
+
+    Expr(:block, (:($sym = $ex) for (ex, sym) in  intermediates)..., ex...)
+end
+
+function inplace_expr(x::AbstractArray, out, intermediates=Dict())
+    # TODO: extract more intermediates
+    :(begin
+          $([:($out[$(Tuple(idx)...)] = $(substitute(x, intermediates)[Tuple(idx)...])) for idx in eachindex(x)]...)
+      end)
+end
+
+function inplace_builtin(term, outsym)
+    isarr(n) = x->symtype(x) <: AbstractArray{<:Any, n}
+    if istree(term) && operation(term) == (*) && length(arguments(term)) == 2
+        A, B = arguments(term)
+        isarr(2)(A) && (isarr(1)(B) || isarr(2)(B)) && return :($mul!($outsym, $A, $B))
+    end
+    return nothing
+end
+
+function get_inputs(x::ArrayOp)
+    unique(mapreduce(axs->map(x->x.A, axs), vcat, values(ranges(x))))
+end
+
+function similar_arrayvar(ex, name)
+    Sym{symtype(ex)}(name) #TODO: shape?
+end
+
+function inplace_expr(x::ArrayOp, outsym = :_out, intermediates = nothing)
+    if x.term !== nothing
+        ex = inplace_builtin(x.term, outsym)
+        if ex !== nothing
+            return ex
+        end
+    end
+
+    rs = copy(ranges(x))
+
+    inters = filter(!issym, get_inputs(x))
+    intermediate_exprs = map(enumerate(inters)) do (i, ex)
+        if !isnothing(intermediates)
+            if haskey(intermediates, ex)
+                return ex => intermediates[ex]
+            else
+                sym = similar_arrayvar(ex, Symbol(outsym, :_input_, i))
+                intermediates[ex] = sym
+                return ex => sym
+            end
+        else
+            return ex => similar_arrayvar(ex, Symbol(outsym, :_input_, i))
+        end
+    end
+
+    loops = best_order(x.output_idx, keys(rs), rs)
+
+    expr = substitute(unwrap(x.expr), Dict(intermediate_exprs))
+
+    inner_expr = :($outsym[$(x.output_idx...)] = $(x.reduce)($outsym[$(x.output_idx...)], $(expr)))
+
+
+    loops = foldl(reverse(loops), init=inner_expr) do acc, k
+        :(for $k in $(get_extents(rs[k]))
+              $acc
+          end)
+    end
+
+    if intermediates === nothing
+        # output the intermediate generation
+        :($(map(x->:($(x[2]) = $(x[1])), intermediate_exprs)...);
+          $loops) |> SymbolicUtils.Code.LiteralExpr
+    else
+        SymbolicUtils.Code.LiteralExpr(loops)
+    end
+end
+
+
+#=
+"""
+Find any inputs to ArrayOp that are ArrayMaker, and return
+how to split all the inputs simultaneously so that the blocks
+can now interact.
+"""
+function get_simultaneous_ranges(ex::ArrayOp)
+    rs = ranges(ex)
+    combine_together = []
+    for (i, arrs) in rs
+        together = unique(map(a->(a.A, a.dim), arrs))
+        if length(together) > 1
+            push!(combine_together, together)
+        end
+    end
+
+    splits = map(combine_together) do group
+        map(group) do a
+            (A, dim) = a
+            if A isa ArrayMaker
+                sort(map(x->x[dim], map(first, A.sequence)), by=first)
+            else
+                [axes(A, dim)]
+            end
+        end
+    end
+
+    combined_splits = map(splits) do rs
+        new_starts = sort!(unique!(reduce(vcat, map(x->first.(x), rs))))
+        lst = maximum(map(maximum, map(x->last.(x), rs)))
+        UnitRange.(new_starts, vcat((new_starts .- 1)[2:end], lst))
+    end
+
+    collected = Dict(A => Any[[1:size(A, dim)] for dim in 1:ndims(A)]
+                     for A in unique(reduce(vcat, map(x->map(a->a.A, x),
+                                                      collect(values(rs))))))
+
+    for (dims, rs) in zip(combine_together, combined_splits)
+        for d in dims
+            collected[d[1]][d[2]] = rs
+        end
+    end
+    collected
+end
+=#

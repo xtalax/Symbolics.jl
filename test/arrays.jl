@@ -1,6 +1,6 @@
 using Symbolics
 using SymbolicUtils, Test
-using Symbolics: symtype, shape, wrap, unwrap, Unknown, Arr, arrterm, jacobian, @variables, value, get_variables
+using Symbolics: symtype, shape, wrap, unwrap, Unknown, Arr, arrterm, jacobian, @variables, value, get_variables, @arrayop
 using Base: Slice
 using SymbolicUtils: Sym, term, operation
 
@@ -37,7 +37,7 @@ end
     XX = unwrap(X)
     @test isequal(unwrap(X[1, :]), Symbolics.@arrayop(XX[1, :], (j,), XX[1, j]))
     @test isequal(unwrap(X[:, 2]), Symbolics.@arrayop(XX[:, 2], (i,), XX[i, 2]))
-    @test isequal(unwrap(X[:, 2:3]), Symbolics.@arrayop(XX[:, 2:3], (i, j), XX[i, j], (+), (j in 2:3)))
+    @test isequal(unwrap(X[:, 2:3]), Symbolics.@arrayop(XX[:, 2:3], (i, j), XX[i, j], (j in 2:3)))
 
     @variables t x[1:4](t)
     @syms i::Int
@@ -71,6 +71,44 @@ getdef(v) = getmetadata(v, Symbolics.VariableDefaultValue)
     @test isequal(Symbolics.scalarize(u + u), [2u[1]])
 
     # #417
+    @test isequal(Symbolics.scalarize(x', (1,1)), x[1])
+
+    # #483
+    # examples by @gronniger
+    @variables A[1:2, 1:2]
+
+    test_mat = [1 2; 3 4]
+    repl_dict = Dict(Symbolics.scalarize(A .=> test_mat))
+    A2 = A^2
+    A3 = A^3
+    A4 = A^4
+    A5 = A^5
+    A6 = A^6
+    A7 = A^7
+
+    @syms i::Int j::Int k::Int l::Int m::Int n::Int
+
+    A_ = unwrap(A)
+    A3_ = wrap(@arrayop (A_*A_*A_) (i, j) A_[i, k] * A_[k, l] * A_[l, j])
+    A4_ = wrap(@arrayop (A_*A_*A_*A_) (i, j) A_[i, k] * A_[k, l] * A_[l, m] * A_[m, j])
+    A5_ = wrap(@arrayop (A_*A_*A_*A_*A_) (i, j) A_[i, k] * A_[k, l] * A_[l, m] * A_[m, n] * A_[n, j])
+
+    @test isequal(Symbolics.scalarize((A*A)[k,k]), A[k, 1]*A[1, k] + A[2, k]*A[k, 2])
+
+    # basic tests:
+    @test iszero((Symbolics.scalarize(A^2) * Symbolics.scalarize(A))[1,1] -
+                  Symbolics.scalarize(A^3)[1,1])
+    @testset "nested scalarize" begin
+        @test isequal(substitute(Symbolics.scalarize(A2 ), repl_dict), test_mat^2)
+        @test isequal(substitute(Symbolics.scalarize(A3_), repl_dict), test_mat^3)
+        @test isequal(substitute(Symbolics.scalarize(A3 ), repl_dict), test_mat^3)
+        @test isequal(substitute(Symbolics.scalarize(A4_), repl_dict), test_mat^4)
+        @test isequal(substitute(Symbolics.scalarize(A4 ), repl_dict), test_mat^4)
+        @test isequal(substitute(Symbolics.scalarize(A5_), repl_dict), test_mat^5)
+        @test isequal(substitute(Symbolics.scalarize(A5 ), repl_dict), test_mat^5)
+        @test isequal(substitute(Symbolics.scalarize(A6 ), repl_dict), test_mat^6)
+        @test isequal(substitute(Symbolics.scalarize(A7 ), repl_dict), test_mat^7)
+    end
     @test isequal(Symbolics.scalarize(x', (1, 1)), x[1])
 end
 
@@ -154,57 +192,40 @@ end
 
 @testset "Rules" begin
     @variables X[1:10, 1:5] Y[1:5, 1:10] b[1:10]
-    r = @rule ((~A * ~B) * ~C) => (~A * (~B * ~C)) where {{{size(~A, 1)} * size(~B, 2)}>size(~B, 1)} * size(~C, 2)
+    r = @rule ((~A * ~B) * ~C) => (~A * (~B * ~C)) where size(~A, 1) * size(~B, 2) >size(~B, 1)  * size(~C, 2)
     @test isequal(r(unwrap((X * Y) * b)), unwrap(X * (Y * b)))
 end
 
 @testset "2D Diffusion Composed With Stencil Interface" begin
     n = rand(8:32)
 
-    @makearray u[1:n, 1:n] begin
+    @variables u[1:n, 1:n]
+    @makearray v[1:n, 1:n] begin
         #interior
-        u[2:end-1, 2:end-1] => @arrayop (i, j) u[i-1, j] + u[i+1, j] + u[i, j-1] + u[i, j+1] - 4 * u[i, j]
+        v[2:end-1, 2:end-1] => @arrayop (i, j) u[i-1, j] + u[i+1, j] + u[i, j-1] + u[i, j+1] - 4 * u[i, j]
         #BCs
-        u[1, 1:end-1] => @arrayop (i, j) 0.0
-        u[n, 1:end-1] => @arrayop (i, j) 0.0
-        u[1:end-1, 1] => @arrayop (i, j) 0.0
-        u[1:end-1, n] => @arrayop (i, j) 0.0
-        #corners
-        u[1, 1] => @arrayop (i, j) 0.0
-        u[n, 1] => @arrayop (i, j) 0.0
-        u[1, n] => @arrayop (i, j) 0.0
-        u[n, n] => @arrayop (i, j) 0.0
+        v[1, 1:end] => 0.0
+        v[n, 1:end] => 0.0
+        v[1:end, 1] => 0.0
+        v[1:end, n] => 0.0
     end
 
     #2D Diffusion composed
     @makearray ucx[1:n, 1:n] begin
-        uc[2:end-1, 2:end-1] => @arrayop (i, j) u[i-1, j] + u[i+1, j] - 2 * u[i, j]
+        ucx[1:end, 1:end] => 0.0 # fill zeros
+        ucx[2:end-1, 2:end-1] => @arrayop (i, j) u[i-1, j] + u[i+1, j] - 2 * u[i, j] (j in 2:n-1)
     end
 
-    @makearray ucy[2:end-1, 2:end-1] begin
-        ucy[2:end-1, 2:end-1] => @arrayop (i, j) u[i, j-1] + u[i, j+1] - 2 * u[i, j]
+    @makearray ucy[1:n, 1:n] begin
+        ucy[1:end, 1:end] => 0.0 # fill zeros
+        ucy[2:end-1, 2:end-1] => @arrayop (i, j) u[i, j-1] + u[i, j+1] - 2 * u[i, j] (i in 2:n-1)
     end
 
     uc = ucx .+ ucy
-    # BCs
-    @setview! uc[1, 2:end-1] @arrayop (i, j) 0.0
 
-
-    @setview! uc[n, 2:end-1] @arrayop (i, j) 0.0
-
-
-    @setview! uc[2:end-1, 1] @arrayop (i, j) 0.0
-
-
-    @setview! uc[2:end-1, n] @arrayop (i, j) 0.0
-
-    # Corners
-    @setview! u[1, 1] @arrayop (i, j) 0.0
-    @setview! u[n, 1] @arrayop (i, j) 0.0
-    @setview! u[1, n] @arrayop (i, j) 0.0
-    @setview! u[n, n] @arrayop (i, j) 0.0
-
-    @test u == uc
+    global V, UC, UCX
+    V, UC, UCX = v, uc, (ucx, ucy)
+    @test isequal(collect(v), collect(uc))
 end
 
 @testset "ND Diffusion, Stencils with CartesianIndices" begin
@@ -234,7 +255,7 @@ end
 
         Dss = map(1:N) do d
             @makearray u[Igrid] begin
-                u[Iinterior] => @arrayop (I) u[I-ē[d]] + u[I+ē[d]] - 2 * u[I]
+                u[Iinterior] => @arrayop u[I-ē[d]] + u[I+ē[d]] - 2 * u[I]
             end
         end
 
