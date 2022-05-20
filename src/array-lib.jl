@@ -39,6 +39,11 @@ function Base.getindex(x::SymArray, idx...)
             end
         end
         res = Term{eltype(symtype(x))}(getindex, [x, idx...])
+    elseif length(idx) == 1 && symtype(first(idx)) <: CartesianIndex
+        i = first(idx)
+        ii = i isa CartesianIndex ? Tuple(i) : arguments(i)
+
+        return getindex(x, ii...)
     else
         input_idx = []
         output_idx = []
@@ -85,6 +90,20 @@ function Base.getindex(x::Arr, idx...)
 end
 function Base.getindex(x::Arr, idx::Symbolic{<:Integer}...)
     wrap(unwrap(x)[idx...])
+end
+
+function Base.CartesianIndex(x::Symbolic{<:Integer}, xs::Symbolic{<:Integer}...)
+    term(CartesianIndex, x, xs..., type=CartesianIndex)
+end
+
+import Base: +, -
+tup(c::CartesianIndex) = Tuple(c)
+tup(c::Term{CartesianIndex}) = arguments(c)
+@wrapped function -(x::CartesianIndex, y::CartesianIndex)
+    CartesianIndex((tup(x) .- tup(y))...)
+end
+@wrapped function +(x::CartesianIndex, y::CartesianIndex)
+    CartesianIndex((tup(x) .+ tup(y))...)
 end
 
 function propagate_ndims(::typeof(getindex), x, idx...)
@@ -167,6 +186,8 @@ Broadcast.result_style(::SymWrapBroadcast) = SymWrapBroadcast()
 
 Broadcast.BroadcastStyle(::SymWrapBroadcast,
                          ::Broadcast.BroadcastStyle) = SymWrapBroadcast()
+Broadcast.BroadcastStyle(::SymBroadcast,
+                         ::SymWrapBroadcast) = Broadcast.Unknown()
 
 function Broadcast.materialize(bc::Broadcast.Broadcasted{SymWrapBroadcast})
     args = map(bc.args) do arg

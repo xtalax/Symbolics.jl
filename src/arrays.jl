@@ -291,9 +291,13 @@ end
 
 function get_extents(xs)
     boundaries = map(x->x.boundary, xs)
-    if all(iszero, boundaries)
+    if all(iszero∘wrap, boundaries)
         get(first(xs))
     else
+        ii = findfirst(x->issym(x) || istree(x), boundaries)
+        if !isnothing(ii)
+            error("Could not find the boundary from symbolic index $(xs[ii]). Please manually specify the range of indices.")
+        end
         extent = get(first(xs))
         start_offset = -reduce(min, filter(x->x<0, boundaries), init=0)
         end_offset = reduce(max, filter(x->x>0, boundaries), init=0)
@@ -793,7 +797,7 @@ function setview(definition, arrayop, inplace)
         try Base.Broadcast.broadcast_shape(map(length, vw), size(op))
         catch err
             if err isa DimensionMismatch
-                throw(DimensionMismatch("setview did not work while assigning " *
+                throw(DimensionMismatch("setview did not work while assigning indices " *
                                         "$vw to $op. LHS has size $(map(length, vw)) "*
                                         "and RHS has size $(size(op)) " *
                                         "-- they need to be broadcastable."))
