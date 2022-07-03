@@ -46,7 +46,7 @@ end
 
 getdef(v) = getmetadata(v, Symbolics.VariableDefaultValue)
 @testset "broadcast & scalarize" begin
-    @variables A[1:5, 1:3] = 42 b[1:3] = [2, 3, 5] t x[1:4](t) u[1:1]
+    @variables A[1:5,1:3]=42 b[1:3]=[2, 3, 5] t x[1:4](t) u[1:1]
     AA = Symbolics.scalarize(A)
     bb = Symbolics.scalarize(b)
     @test all(isequal(42), getdef.(AA))
@@ -118,6 +118,12 @@ end
     @test Symbolics.getparent(collect(x)[1]).metadata === x.metadata
 end
 
+@testset "Parent" begin
+    @variables t x[1:4](t)
+    x = unwrap(x)
+    @test Symbolics.getparent(collect(x)[1]).metadata === x.metadata
+end
+
 n = 2
 A = randn(n, n)
 foo(x) = A * x # a function to represent symbolically, note, if this function is defined inside the testset, it's not found by the function fun_eval = eval(fun_ex)
@@ -177,12 +183,12 @@ end
 
     @test shape(ex) == shape(x)
 
-    fun_genf = build_function(ex, x, expression=Val{false})
+    fun_iip, fun_genf = build_function(ex, x, expression=Val{false})
     @test fun_genf(x0) == A * x0
 
     # Generate an expression instead and eval it manually
-    fun_ex = build_function(ex, x, expression=Val{true})
-    fun_eval = eval(fun_ex)
+    fun_ex_ip, fun_ex_oop = build_function(ex, x, expression=Val{true})
+    fun_eval = eval(fun_ex_oop)
     @test fun_eval(x0) == foo(x0)
 
     ## Jacobians
@@ -279,9 +285,7 @@ end
     @test isequal(collect(D), collect(Dxxu .+ Dyyu))
 end
 
-limit(a, N) = a == N + 1 ? 1 : a == 0 ? N : a
-@register limit(a, N)::Integer
-let
+@testset "Brusselator stencil" begin
     n = 8
     @variables t u[1:n, 1:n](t) v[1:n, 1:n](t)
 
@@ -293,6 +297,7 @@ let
     A = 3.4
     alpha = 10.0
 
+    limit = Main.limit
     dtu = @arrayop (i, j) alpha * (u[limit(i - 1, n), j] +
                                    u[limit(i + 1, n), j] +
                                    u[i, limit(j + 1, n)] +
@@ -300,9 +305,22 @@ let
                                    4u[i, j]) +
                           1.0 + u[i, j]^2 * v[i, j] - (A + 1) *
                             u[i, j] + brusselator_f(x[i], y[j], t) i in 1:n j in 1:n
-    dtv = @arrayop (i, j) alpha * (v[limit(i - 1, n), j] + v[limit(i + 1, n), j] + v[i, limit(j + 1, n)] + v[i, limit(j - 1, n)] - 4v[i, j]) - u[i, j]^2 * v[i, j] + A * u[i, j] i in 1:n j in 1:n
-    lapu = @arrayop (i, j) u[limit(i - 1, n), j] + u[limit(i + 1, n), j] + u[i, limit(j + 1, n)] + u[i, limit(j - 1, n)] - 4u[i, j] i in 1:n j in 1:n
-    lapv = @arrayop (i, j) v[limit(i - 1, n), j] + v[limit(i + 1, n), j] + v[i, limit(j + 1, n)] + v[i, limit(j - 1, n)] - 4v[i, j] i in 1:n j in 1:n
+    dtv = @arrayop (i, j) alpha * (v[limit(i - 1, n), j] +
+                                   v[limit(i + 1, n), j] +
+                                   v[i, limit(j + 1, n)] +
+                                   v[i, limit(j - 1, n)] -
+                                   4v[i, j]) -
+                          u[i, j]^2 * v[i, j] + A * u[i, j] i in 1:n j in 1:n
+    lapu = @arrayop (i, j) (u[limit(i - 1, n), j] +
+                            u[limit(i + 1, n), j] +
+                            u[i, limit(j + 1, n)] +
+                            u[i, limit(j - 1, n)] -
+                            4u[i, j]) i in 1:n j in 1:n
+    lapv = @arrayop (i, j) (v[limit(i - 1, n), j] +
+                            v[limit(i + 1, n), j] +
+                            v[i, limit(j + 1, n)] +
+                            v[i, limit(j - 1, n)] -
+                            4v[i, j]) i in 1:n j in 1:n
     s = brusselator_f.(x, y', t)
 
     dtu = wrap(dtu)
@@ -310,6 +328,20 @@ let
     lapu = wrap(lapu)
     lapv = wrap(lapv)
 
-    @test isequal(collect(dtu), collect(1 .+ v .* u.^2 .- (A + 1) .* u .+ alpha .* lapu .+ s))
-    @test isequal(collect(dtv), collect(A .* u .- u.^2 .* v .+ alpha .* lapv))
+    f, g = build_function(dtu, u, v, t, expression=Val{false})
+    du = zeros(Num, 8, 8)
+    #f(du, u,v,t)
+    #@test isequal(collect(du), collect(dtu))
+
+    #@test isequal(collect(dtu), collect(1 .+ v .* u.^2 .- (A + 1) .* u .+ alpha .* lapu .+ s))
+    #@test isequal(collect(dtv), collect(A .* u .- u.^2 .* v .+ alpha .* lapv))
+end
+
+@testset "Partial array substitution" begin
+    @variables x[1:3] A[1:2, 1:2, 1:2]
+
+    @test substitute(x[1], Dict(x => [1, 2, 3])) === Num(1)
+    @test substitute(A[1,2,1], Dict(A => reshape(1:8, 2, 2, 2))) === Num(3)
+
+    @test substitute(A[1,2,1], Dict(A[1,2,1] => 9)) === Num(9)
 end

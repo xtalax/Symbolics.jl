@@ -762,7 +762,8 @@ end
 function get_indexers(ex)
     @assert ex.head == :ref
     arr = ex.args[1]
-    replace_ends(arr, ex.args[2:end])
+    args = map(((i,x),)->x == Symbol(":") ? :(1:lastindex($arr, $i)) : x, enumerate(ex.args[2:end]))
+    replace_ends(arr, args)
 end
 
 function search_and_replace(expr, key, val)
@@ -876,15 +877,16 @@ function _cat(x, xs...; dims)
     end
 end
 
-Base.cat(x::Arr, xs...; dims) = _cat(x, xs...; dims)
-Base.cat(x::AbstractArray, y::Arr, xs...; dims) = _cat(x, y, xs...; dims)
+# Base.cat(x::Arr, xs...; dims) = _cat(x, xs...; dims)
+# Base.cat(x::AbstractArray, y::Arr, xs...; dims) = _cat(x, y, xs...; dims)
 
-Base.vcat(x::Arr, xs::AbstractVecOrMat...) = cat(x, xs..., dims=1)
-Base.hcat(x::Arr, xs::AbstractVecOrMat...) = cat(x, xs..., dims=2)
-Base.vcat(x::AbstractVecOrMat, y::Arr, xs::AbstractVecOrMat...) = _cat(x, y, xs..., dims=1)
-Base.hcat(x::AbstractVecOrMat, y::Arr, xs::AbstractVecOrMat...) = _cat(x, y, xs..., dims=2)
-Base.vcat(x::Arr, y::Arr) = _cat(x, y, dims=1) # plug ambiguity
-Base.hcat(x::Arr, y::Arr) = _cat(x, y, dims=2)
+# vv uncomment these for a major release
+# Base.vcat(x::Arr, xs::AbstractVecOrMat...) = cat(x, xs..., dims=1)
+# Base.hcat(x::Arr, xs::AbstractVecOrMat...) = cat(x, xs..., dims=2)
+# Base.vcat(x::AbstractVecOrMat, y::Arr, xs::AbstractVecOrMat...) = _cat(x, y, xs..., dims=1)
+# Base.hcat(x::AbstractVecOrMat, y::Arr, xs::AbstractVecOrMat...) = _cat(x, y, xs..., dims=2)
+# Base.vcat(x::Arr, y::Arr) = _cat(x, y, dims=1) # plug ambiguity
+# Base.hcat(x::Arr, y::Arr) = _cat(x, y, dims=2)
 
 function scalarize(x::ArrayMaker)
     T = eltype(x)
@@ -915,6 +917,10 @@ function scalarize(x::ArrayMaker, idx)
             end
         end
     end
+    if !any(x->issym(x) || istree(x), idx) && all(in.(idx, axes(x)))
+        throw(UndefRefError())
+    end
+
     throw(BoundsError(x, idx))
 end
 
@@ -927,8 +933,7 @@ function SymbolicUtils.Code.toexpr(x::ArrayOp, st)
     if istree(x.term)
         toexpr(x.term, st)
     else
-        throw(ArgumentError("""Don't know how to turn $x
-                               into code yet"""))
+        _array_toexpr(x, st)
     end
 end
 
@@ -937,20 +942,29 @@ function SymbolicUtils.Code.toexpr(x::Arr, st)
 end
 
 function SymbolicUtils.Code.toexpr(x::ArrayMaker, st)
+    _array_toexpr(x, st)
+end
+
+function _array_toexpr(x, st)
     outsym = Symbol("_out")
-    N = length(x.shape)
-    ex = :(let $outsym = zeros(Float64, map(length, ($(x.shape...),)))
+    N = length(shape(x))
+    ex = :(let $outsym = zeros(Float64, map(length, ($(shape(x)...),)))
           $(inplace_expr(x, outsym))
           $outsym
       end) |> LiteralExpr
     toexpr(ex, st)
 end
 
-function inplace_expr(x, out_array)
-    :(copy!($out_array, $x))
+function inplace_expr(x, out_array, dict=nothing)
+    x = unwrap(x)
+    if symtype(x) <: Number
+        :($out_array .= $x)
+    else
+        :($copy!($out_array, $x))
+    end
 end
 
-function inplace_expr(x::ArrayMaker, out = :_out)
+function inplace_expr(x::ArrayMaker, out, dict=Dict())
     ex = []
 
     intermediates = Dict()
@@ -979,12 +993,30 @@ function inplace_builtin(term, outsym)
     return nothing
 end
 
+function find_inter(acc, expr)
+    if !issym(expr) && symtype(expr) <: AbstractArray
+        push!(acc, expr)
+    elseif istree(expr)
+        foreach(x -> find_inter(acc, x), arguments(expr))
+    end
+    acc
+end
+
 function get_inputs(x::ArrayOp)
-    unique(mapreduce(axs->map(x->x.A, axs), vcat, values(ranges(x))))
+    unique(find_inter([], x.expr))
 end
 
 function similar_arrayvar(ex, name)
     Sym{symtype(ex)}(name) #TODO: shape?
+end
+
+function reset_to_one(range)
+    @assert step(range) == 1
+    Base.OneTo(length(range))
+end
+
+function reset_sym(i)
+    Sym{Int}(Symbol(nameof(i), "′"))
 end
 
 function inplace_expr(x::ArrayOp, outsym = :_out, intermediates = nothing)
@@ -1016,13 +1048,21 @@ function inplace_expr(x::ArrayOp, outsym = :_out, intermediates = nothing)
 
     expr = substitute(unwrap(x.expr), Dict(intermediate_exprs))
 
-    inner_expr = :($outsym[$(x.output_idx...)] = $(x.reduce)($outsym[$(x.output_idx...)], $(expr)))
+    out_idxs = map(reset_sym, x.output_idx)
+    inner_expr = :($outsym[$(out_idxs...)] = $(x.reduce)($outsym[$(out_idxs...)], $(expr)))
 
 
     loops = foldl(reverse(loops), init=inner_expr) do acc, k
-        :(for $k in $(get_extents(rs[k]))
-              $acc
-          end)
+        if any(isequal(k), x.output_idx)
+            :(for ($k, $(reset_sym(k))) in zip($(get_extents(rs[k])),
+                                               reset_to_one($(get_extents(rs[k]))))
+                  $acc
+              end)
+        else
+            :(for $k in $(get_extents(rs[k]))
+                  $acc
+              end)
+        end
     end
 
     if intermediates === nothing
